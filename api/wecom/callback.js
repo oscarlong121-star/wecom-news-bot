@@ -231,15 +231,37 @@ module.exports = async (request, response) => {
     if (request.method === 'GET') {
       // URL 验证
       console.log('🔍 收到 URL 验证请求');
+      console.log('Signature:', signature);
+      console.log('Timestamp:', timestamp);
+      console.log('Nonce:', nonce);
+      console.log('EchoStr:', echoStr ? '存在' : '不存在');
       
       const echoStr = request.query.echostr || '';
+      
+      // 先尝试验证明文（企业微信可能发送明文）
+      const sortedList = [TOKEN, timestamp, nonce, echoStr].sort();
+      const concatenated = sortedList.join('');
+      const crypto = require('crypto');
+      const calculatedSignature = crypto.createHash('sha1').update(concatenated).digest('hex');
+      
+      console.log('计算签名:', calculatedSignature);
+      console.log('接收签名:', signature);
+      
+      if (calculatedSignature === signature) {
+        console.log('✅ URL 验证成功（明文模式）');
+        return response.status(200).send(echoStr);
+      }
+      
+      // 尝试验证加密模式
       const decrypted = crypt.verifyURL(echoStr, signature, timestamp, nonce);
 
       if (decrypted) {
-        console.log('✅ URL 验证成功');
+        console.log('✅ URL 验证成功（加密模式）');
         return response.status(200).send(decrypted);
       } else {
         console.error('❌ URL 验证失败');
+        console.error('期望签名:', calculatedSignature);
+        console.error('实际签名:', signature);
         return response.status(403).send('验证失败');
       }
     }
