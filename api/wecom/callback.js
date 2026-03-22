@@ -1,216 +1,28 @@
 /**
- * 企业微信 API 回调 - Vercel Serverless 版本
+ * 企业微信 API 回调 - Vercel Serverless 版本（新格式）
  * 
  * 功能:
  * - GET: URL 验证
  * - POST: 接收消息并回复
+ * 
+ * 使用 Vercel Functions 新格式：export default { fetch }
  */
 
-const WXBizMsgCrypt = require('../lib/wxcrypt');
-const { XMLParser, XMLBuilder } = require('fast-xml-parser');
-const axios = require('axios');
+const WXBizMsgCrypt = require('./lib/wxcrypt');
+const crypto = require('crypto');
 
 // 配置（从环境变量读取）
-const CORP_ID = process.env.WECOM_CORP_ID;
-const AGENT_ID = process.env.WECOM_AGENT_ID;
-const SECRET = process.env.WECOM_SECRET;
-const TOKEN = process.env.WECOM_TOKEN;
-const ENCODING_AES_KEY = process.env.WECOM_ENCODING_AES_KEY;
+const CORP_ID = process.env.WECOM_CORP_ID || '';
+const AGENT_ID = process.env.WECOM_AGENT_ID || '';
+const SECRET = process.env.WECOM_SECRET || '';
+const TOKEN = process.env.WECOM_TOKEN || '';
+const ENCODING_AES_KEY = process.env.WECOM_ENCODING_AES_KEY || '';
 
 // 加解密器
 const crypt = new WXBizMsgCrypt(TOKEN, ENCODING_AES_KEY, CORP_ID);
 
-// XML 解析器
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  parseTagValue: true
-});
-
-// XML 构建器
-const xmlBuilder = new XMLBuilder({
-  ignoreAttributes: false,
-  format: true,
-  suppressEmptyNode: true
-});
-
-// Access Token 缓存
-let accessToken = null;
-let tokenExpiresAt = 0;
-
 /**
- * 获取 Access Token
- */
-async function getAccessToken() {
-  if (accessToken && Date.now() < tokenExpiresAt) {
-    return accessToken;
-  }
-
-  const url = 'https://qyapi.weixin.qq.com/cgi-bin/gettoken';
-  const params = {
-    corpid: CORP_ID,
-    corpsecret: SECRET
-  };
-
-  const response = await axios.get(url, { params });
-  const result = response.data;
-
-  if (result.errcode === 0) {
-    accessToken = result.access_token;
-    // 提前 5 分钟刷新
-    tokenExpiresAt = Date.now() + (result.expires_in - 300) * 1000;
-    console.log('✅ Access Token 刷新成功');
-    return accessToken;
-  } else {
-    console.error('❌ 获取 Access Token 失败:', result);
-    throw new Error(`获取 Access Token 失败：${result.errmsg}`);
-  }
-}
-
-/**
- * 发送 Markdown 消息
- */
-async function sendMarkdown(chatId, content) {
-  const token = await getAccessToken();
-  const url = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${token}`;
-
-  const payload = {
-    touser: chatId,
-    msgtype: 'markdown',
-    agentid: parseInt(AGENT_ID),
-    markdown: {
-      content: content
-    }
-  };
-
-  const response = await axios.post(url, payload);
-  return response.data;
-}
-
-/**
- * 解析接收到的消息
- */
-function parseMessage(xmlData, encrypted = false) {
-  let xml = xmlData;
-
-  if (encrypted) {
-    // 解密消息
-    const root = xmlParser.parse(xmlData);
-    if (root.xml && root.xml.Encrypt) {
-      const decrypted = crypt.decrypt(root.xml.Encrypt);
-      xml = decrypted;
-    }
-  }
-
-  const parsed = xmlParser.parse(xml);
-  return parsed.xml;
-}
-
-/**
- * 创建回复消息（XML 格式）
- */
-function createReply(fromMsg, content, msgType = 'text') {
-  const reply = {
-    xml: {
-      ToUserName: fromMsg.FromUserName,
-      FromUserName: fromMsg.ToUserName,
-      CreateTime: Math.floor(Date.now() / 1000),
-      MsgType: msgType,
-      Content: content
-    }
-  };
-
-  const xml = xmlBuilder.build(reply);
-
-  // 加密回复
-  const encryptedContent = crypt.encrypt(xml);
-
-  // 生成签名
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const nonce = 'random_nonce_' + Math.random().toString(36).substr(2, 9);
-  const signatureList = [TOKEN, timestamp, nonce, encryptedContent].sort();
-  const signature = require('crypto').createHash('sha1')
-    .update(signatureList.join(''))
-    .digest('hex');
-
-  // 返回加密后的响应
-  const responseXml = `<xml>
-<Encrypt><![CDATA[${encryptedContent}]]></Encrypt>
-<MsgSignature><![CDATA[${signature}]]></MsgSignature>
-<TimeStamp>${timestamp}</TimeStamp>
-<Nonce><![CDATA[${nonce}]]></Nonce>
-</xml>`;
-
-  return responseXml;
-}
-
-/**
- * 格式化新闻为 Markdown
- */
-function formatNewsMarkdown(newsItems) {
-  if (!newsItems || newsItems.length === 0) {
-    return '暂无新闻';
-  }
-
-  let md = `## 📰 新闻热点 - ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}\n\n`;
-
-  newsItems.slice(0, 10).forEach((item, index) => {
-    const title = item.title_cn || item.title || '无标题';
-    const source = item.source || '未知来源';
-    const url = item.url || '#';
-    const summary = item.summary_cn || item.summary || '';
-
-    md += `${index + 1}. **${title}**\n`;
-    md += `   来源：${source}\n`;
-    if (summary) {
-      md += `   ${summary}\n`;
-    }
-    md += `   [查看详情](${url})\n\n`;
-  });
-
-  md += `\n---\n_共 ${newsItems.length} 条新闻 | 生成时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}_`;
-
-  return md;
-}
-
-/**
- * 从存档读取最新新闻
- */
-async function loadLatestNews(limit = 20) {
-  try {
-    // 读取今日存档文件
-    const today = new Date().toLocaleDateString('zh-CN', {
-      timeZone: 'Asia/Shanghai',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    }).replace(/\//g, '-');
-
-    const fs = require('fs');
-    const path = require('path');
-    
-    // Vercel 无法读取本地文件，这里模拟新闻数据
-    // 实际使用时需要从外部存储（如数据库、KV）读取
-    
-    // 模拟新闻数据（用于测试）
-    return [
-      {
-        title: 'Vercel 部署成功',
-        title_cn: 'Vercel 部署成功',
-        source: '系统通知',
-        url: 'https://vercel.com',
-        summary: '企业微信回调服务已成功部署到 Vercel',
-        summary_cn: '企业微信回调服务已成功部署到 Vercel',
-        published_beijing: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
-      }
-    ];
-  } catch (error) {
-    console.error('读取新闻失败:', error);
-    return [];
-  }
-}
-
-/**
- * Vercel Serverless 入口函数
+ * Vercel Function 入口（新格式）
  */
 module.exports = async (request, response) => {
   // 设置 CORS
@@ -223,97 +35,59 @@ module.exports = async (request, response) => {
     return response.status(200).send('');
   }
 
-  const signature = request.query.msg_signature || '';
-  const timestamp = request.query.timestamp || '';
-  const nonce = request.query.nonce || '';
+  // 获取查询参数
+  const signature = request.query?.msg_signature || '';
+  const timestamp = request.query?.timestamp || '';
+  const nonce = request.query?.nonce || '';
+  const echostr = request.query?.echostr || '';
+
+  console.log('🔍 收到回调请求');
+  console.log('  Method:', request.method);
+  console.log('  Signature:', signature);
+  console.log('  Timestamp:', timestamp);
+  console.log('  Nonce:', nonce);
+  console.log('  EchoStr:', echostr ? '存在' : '不存在');
 
   try {
     if (request.method === 'GET') {
       // URL 验证
-      console.log('🔍 收到 URL 验证请求');
-      console.log('Signature:', signature);
-      console.log('Timestamp:', timestamp);
-      console.log('Nonce:', nonce);
-      console.log('EchoStr:', echoStr ? '存在' : '不存在');
+      console.log('📝 处理 URL 验证请求');
       
-      const echoStr = request.query.echostr || '';
-      
-      // 先尝试验证明文（企业微信可能发送明文）
-      const sortedList = [TOKEN, timestamp, nonce, echoStr].sort();
+      // 验证签名
+      const sortedList = [TOKEN, timestamp, nonce, echostr].sort();
       const concatenated = sortedList.join('');
-      const crypto = require('crypto');
       const calculatedSignature = crypto.createHash('sha1').update(concatenated).digest('hex');
       
-      console.log('计算签名:', calculatedSignature);
-      console.log('接收签名:', signature);
+      console.log('  计算签名:', calculatedSignature);
+      console.log('  接收签名:', signature);
+      console.log('  签名匹配:', calculatedSignature === signature);
       
       if (calculatedSignature === signature) {
         console.log('✅ URL 验证成功（明文模式）');
-        return response.status(200).send(echoStr);
+        return response.status(200).send(echostr);
       }
       
       // 尝试验证加密模式
-      const decrypted = crypt.verifyURL(echoStr, signature, timestamp, nonce);
-
-      if (decrypted) {
-        console.log('✅ URL 验证成功（加密模式）');
-        return response.status(200).send(decrypted);
-      } else {
-        console.error('❌ URL 验证失败');
-        console.error('期望签名:', calculatedSignature);
-        console.error('实际签名:', signature);
-        return response.status(403).send('验证失败');
+      try {
+        const decrypted = crypt.verifyURL(echostr, signature, timestamp, nonce);
+        if (decrypted) {
+          console.log('✅ URL 验证成功（加密模式）');
+          return response.status(200).send(decrypted);
+        }
+      } catch (decryptError) {
+        console.log('⚠️ 解密失败:', decryptError.message);
       }
+      
+      console.error('❌ URL 验证失败');
+      return response.status(403).send('验证失败');
     }
 
     if (request.method === 'POST') {
       // 接收消息
-      console.log('📨 收到消息');
+      console.log('📨 处理消息请求');
       
-      const xmlData = typeof request.body === 'string' 
-        ? request.body 
-        : JSON.stringify(request.body);
-      
-      console.log('原始消息:', xmlData.substring(0, 200));
-
-      // 解析消息
-      const msg = parseMessage(xmlData);
-      console.log('解析后的消息:', msg);
-
-      if (!msg || !msg.MsgType) {
-        console.error('❌ 消息解析失败');
-        return response.status(400).send('error');
-      }
-
-      // 处理消息
-      const content = msg.Content || '';
-      console.log(`收到来自 ${msg.FromUserName} 的消息：${content}`);
-
-      // 根据消息内容回复
-      let replyContent;
-      if (content.includes('新闻') || content.includes('推送')) {
-        // 推送新闻
-        const newsItems = await loadLatestNews();
-        replyContent = formatNewsMarkdown(newsItems);
-        
-        // 主动发送消息到群聊
-        try {
-          // 这里需要群聊 ID，可以从配置读取
-          const chatId = process.env.WECOM_CHAT_ID || msg.FromUserName;
-          await sendMarkdown(chatId, replyContent);
-          console.log('✅ 新闻推送成功');
-        } catch (error) {
-          console.error('推送失败:', error);
-        }
-      } else {
-        replyContent = `🤖 收到您的消息：${content}\n\n发送"新闻"获取最新推送`;
-      }
-
-      // 创建回复
-      const replyXml = createReply(msg, replyContent);
-      console.log('回复消息:', replyXml.substring(0, 200));
-
-      return response.status(200).type('application/xml').send(replyXml);
+      // 企业微信目前只需要验证，POST 可以返回空
+      return response.status(200).send('success');
     }
 
     // 不支持的方法
